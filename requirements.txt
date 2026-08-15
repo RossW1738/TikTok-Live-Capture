@@ -1,0 +1,4 @@
+requests>=2.31.0
+
+# Optional: only needed if you use live transcription (Transcribe: ON)
+faster-whisper>=1.0.0

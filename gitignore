@@ -1,0 +1,19 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+
+# Recordings & runtime data (paths are user-configured at the top of rec.py)
+recordings/
+logs/
+data/
+*.flv
+*.mp4
+*.wav
+
+# Local session cookies — never commit these
+cookies.json
+
+# Editor/OS cruft
+.vscode/
+.idea/
+.DS_Store
