@@ -52,10 +52,10 @@ Watches a list of creators, automatically starts recording the moment any of the
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo>
-cd <your-repo>
+git clone https://github.com/RossW1738/TikTok-Live-Capture.git
+cd TikTok-Live-Capture
 pip install -r requirements.txt
-python rec.py
+python tiktok-live-capture.py
 ```
 
 Transcription is optional — if you don't plan to use it, you can skip installing `faster-whisper` and leave the `Transcribe` toggle off in the app.
@@ -68,7 +68,7 @@ If you want authenticated fetches, drop your session cookies into `cookies.json`
 
 ## Where files go
 
-By default everything lives under `~/TikTokLiveRecorder` (your home directory), set at the top of `rec.py` via `BASE_DIR`. Nothing here is configurable from the app itself — if you want a different location, edit `BASE_DIR` before running.
+By default everything lives under `~/TikTokLiveRecorder` (your home directory), set at the top of `tiktok-live-capture.py` via `BASE_DIR`. Nothing here is configurable from the app itself — if you want a different location, edit `BASE_DIR` before running.
 
 ```
 ~/TikTokLiveRecorder/
