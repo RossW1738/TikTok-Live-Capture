@@ -4,6 +4,8 @@ A multi-stream, auto-monitoring TikTok Live recorder with live transcription.
 
 Watches a list of creators, automatically starts recording the moment any of them goes live, rides out disconnects, lag, and more without losing footage, and (optionally) generates a rolling live transcript as the stream records.
 
+![App screenshot](docs/screenshot.png)
+
 ---
 
 ## Features
