@@ -47,7 +47,7 @@ Watches a list of creators, automatically starts recording the moment any of the
 - Python 3.x
 - [FFmpeg](https://ffmpeg.org/download.html) installed and on your PATH
 - Windows (current build relies on Windows-specific APIs)
-- [curl_cffi](https://github.com/lexiforest/curl_cffi) (installed via `requirements.txt`) — used for stream-URL fetches instead of plain `requests`, since TikTok's edge has been observed fingerprinting non-browser TLS handshakes and blocking them regardless of headers.
+- [curl_cffi](https://github.com/lexiforest/curl_cffi) (installed via `requirements.txt`) — used for stream-URL fetches instead of plain `requests`.
 - Optional, for automatically clearing bot-check/verification pages: [Playwright](https://playwright.dev/python/) (installed via `requirements.txt`). After installing the package, also run `playwright install chromium` once to download the browser binary it drives — pip alone doesn't fetch it.
 - Optional, for live transcription: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (installed via `requirements.txt`). Uses a CUDA GPU if available and falls back to CPU automatically — CPU transcription works but is noticeably slower.
 
