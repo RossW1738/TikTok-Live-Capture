@@ -4,8 +4,6 @@ A multi-stream, auto-monitoring TikTok Live recorder with live transcription.
 
 Watches a list of creators, automatically starts recording the moment any of them goes live, rides out disconnects, lag, and more without losing footage, and (optionally) generates a rolling live transcript as the stream records.
 
-![App screenshot](docs/screenshot.png)
-
 ---
 
 ## Features
@@ -17,10 +15,10 @@ Watches a list of creators, automatically starts recording the moment any of the
 - Startup recovery pass for any raw files left over from a crash or force-close
 
 ### Stream discovery & quality
-- Fetches stream URLs directly via HTTP
 - Ranks available stream variants and always selects the highest quality tier
 - Refuses to start a recording on a low quality stream without permission
 - Optional cookie support for authenticated fetches
+- Detects when TikTok serves a bot-check/verification page instead of the real one, — see [Bot-check & verification](#bot-check--verification) below
 
 ### Reliability
 - Automatic reconnect with a capped retry count
@@ -49,6 +47,8 @@ Watches a list of creators, automatically starts recording the moment any of the
 - Python 3.x
 - [FFmpeg](https://ffmpeg.org/download.html) installed and on your PATH
 - Windows (current build relies on Windows-specific APIs)
+- [curl_cffi](https://github.com/lexiforest/curl_cffi) (installed via `requirements.txt`) — used for stream-URL fetches instead of plain `requests`, since TikTok's edge has been observed fingerprinting non-browser TLS handshakes and blocking them regardless of headers.
+- Optional, for automatically clearing bot-check/verification pages: [Playwright](https://playwright.dev/python/) (installed via `requirements.txt`). After installing the package, also run `playwright install chromium` once to download the browser binary it drives — pip alone doesn't fetch it.
 - Optional, for live transcription: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (installed via `requirements.txt`). Uses a CUDA GPU if available and falls back to CPU automatically — CPU transcription works but is noticeably slower.
 
 ## Installation
@@ -57,16 +57,22 @@ Watches a list of creators, automatically starts recording the moment any of the
 git clone https://github.com/RossW1738/TikTok-Live-Capture.git
 cd TikTok-Live-Capture
 pip install -r requirements.txt
+playwright install chromium
 python tiktok-live-capture.py
 ```
 
-Transcription is optional — if you don't plan to use it, you can skip installing `faster-whisper` and leave the `Transcribe` toggle off in the app.
+Transcription is optional — if you don't plan to use it, you can skip installing `faster-whisper` and leave the `Transcribe` toggle off in the app. The `playwright install chromium` step is only needed if you want the manual verification browser; skipping it just means that feature logs a warning and does nothing when a bot-check page comes up.
 
 ## Configuration
 
 Recording output directory, log directory, and other paths are set at the top of the script. 
 
 If you want authenticated fetches, drop your session cookies into `cookies.json` in the data directory.
+
+## Bot-check & verification
+
+- On launch, the app runs a one-off session check against your first monitored target and opens the same solve browser automatically if the saved session is already stale — you don't have to wait for a live check to fail first. 
+- If `playwright` isn't installed, a bot-check page just logs a warning instead of opening a browser — install it (see Requirements) to enable this.
 
 ## Where files go
 
@@ -77,7 +83,11 @@ By default everything lives under `~/TikTokLiveRecorder` (your home directory), 
 ├── data/
 │   ├── monitored_targets.json   # your watchlist — written on first launch, even if empty
 │   ├── quality_settings.json    # written the first time you touch a quality setting in the UI
-│   └── cookies.json             # optional, never created automatically — you add this yourself
+│   ├── cookies.json             # session cookies — created for you the first time the manual
+│   │                             # verification browser clears a bot-check; you can also drop
+│   │                             # your own in here by hand (see Configuration below)
+│   └── playwright_profile/      # persistent browser profile for the verification browser —
+│                                 # only appears if you've used that feature at least once
 ├── recordings/
 │   ├── _ORPHAN_RECOVERED/       # raw files recovered from a crash or force-close land here
 │   ├── _transcript_chunks/      # temporary per-recording audio chunks, auto-cleaned as they're transcribed

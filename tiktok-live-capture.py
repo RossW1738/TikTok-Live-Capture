@@ -11,6 +11,18 @@ import json
 from urllib.parse import quote
 import uuid
 import requests
+try:
+    from curl_cffi import requests as cffi_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    cffi_requests = None
+    CURL_CFFI_AVAILABLE = False
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    sync_playwright = None
+    PLAYWRIGHT_AVAILABLE = False
 
 # ── User Configuration ──
 # Update these paths for your own machine before running.
@@ -58,11 +70,16 @@ GLOBAL_QUALITY_SETTINGS = {"preferred": "origin", "allow_lower": False}
 
 # ── HTTP stream-URL fetcher configuration ──
 COOKIES_FILE = os.path.join(DATA_DIR, "cookies.json")
+PLAYWRIGHT_PROFILE_DIR = os.path.join(DATA_DIR, "playwright_profile")
 HTTP_POLLER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+# Must match a profile curl_cffi actually ships (see curl_cffi.requests.BrowserType);
+# keep this in step with the Chrome version in the UA string above.
+CURL_CFFI_IMPERSONATE = "chrome131"
 HTTP_POLLER_HYDRATION_IDS = ["SIGI_STATE", "__UNIVERSAL_DATA_FOR_REHYDRATION__"]
+CHALLENGE_PAGE_DETAIL = "no hydration data found (likely a bot-check challenge page)"
 
 # ── Polling Interval Presets ──
 POLL_INTERVAL_PRESETS = [15, 30, 60, 120, 300]
@@ -1050,6 +1067,26 @@ def start_auto_monitor(username, target_config=None, open_settings_if_new=False)
                 continue
 
             time.sleep(0.2 * (int(task_id.replace("task_", "")) % 5))
+
+            # If this username is already actively recording under some other
+            # task, there's nothing useful a live-status poll can do - skip
+            # the network fetch (and any bot-check/challenge it could
+            # trigger) entirely rather than hitting TikTok for a URL nobody
+            # needs while a good recording is already running.
+            already_recording_elsewhere = any(
+                other_tid != task_id
+                and other_task.get("username")
+                and other_task["username"].lower() == key
+                and other_task.get("proc") is not None
+                and other_task["proc"].poll() is None
+                for other_tid, other_task in list(active_tasks.items())
+            )
+            if already_recording_elsewhere:
+                update_inactive_target_status(username, "[AUTOMATIC] Already recording (other task)")
+                set_task_sub_status(task_id, "🔴 Recording (other task)")
+                time.sleep(custom_interval)
+                continue
+
             update_inactive_target_status(username, "[AUTOMATIC] Checking live status...")
             set_task_sub_status(task_id, "🔍 Checking Stream...")
 
@@ -1058,7 +1095,55 @@ def start_auto_monitor(username, target_config=None, open_settings_if_new=False)
             with http_request_lock:
                 url, detail = fetch_stream_url_http(username, pref_rank, allow_lower)
 
+            if detail == CHALLENGE_PAGE_DETAIL and not is_shutting_down:
+                # Background/automated polling has no human watching it, so it
+                # opens the solve browser itself with no confirmation prompt -
+                # gated by a global cooldown (not per-target) so at most one
+                # unattended browser opens across ALL targets every
+                # AUTO_CHALLENGE_COOLDOWN seconds, and only one is ever open
+                # at a time (enforced inside run_manual_challenge_browser).
+                # If the bot-check keeps recurring faster than that cadence,
+                # silent auto-retry has stopped being enough - fall back to
+                # the "Verification Required" dialog instead of doing nothing.
+                global _last_auto_challenge_attempt
+                now = time.time()
+                if _challenge_browser_active_user is not None:
+                    update_inactive_target_status(username, "[AUTOMATIC] Bot-check - waiting on browser (busy)")
+                    set_task_sub_status(task_id, "⚠ Waiting on browser")
+                elif (now - _last_auto_challenge_attempt) > AUTO_CHALLENGE_COOLDOWN:
+                    _last_auto_challenge_attempt = now
+                    root.after(0, lambda u=username: log(
+                        f"[Auto] @{u}: bot-check page detected during background poll - "
+                        f"opening a browser window to refresh the session automatically.", "warn"
+                    ))
+                    root.after(0, lambda u=username, pr=pref_rank, al=allow_lower: run_manual_challenge_browser(u, pr, al))
+                    update_inactive_target_status(username, "[AUTOMATIC] Bot-check - browser solving...")
+                    set_task_sub_status(task_id, "⚠ Verification needed")
+                else:
+                    root.after(0, lambda u=username: log(
+                        f"[Auto] @{u}: bot-check recurring faster than the "
+                        f"{AUTO_CHALLENGE_COOLDOWN}s auto-retry window - asking for a manual solve.", "warn"
+                    ))
+                    root.after(0, lambda u=username, pr=pref_rank, al=allow_lower: prompt_manual_challenge_browser(u, pr, al))
+                    update_inactive_target_status(username, "[AUTOMATIC] Bot-check - verification needed")
+                    set_task_sub_status(task_id, "⚠ Verification needed")
+
             if url and not is_shutting_down:
+                duplicate_active = any(
+                    other_tid != task_id
+                    and other_task.get("username")
+                    and other_task["username"].lower() == key
+                    and other_task.get("proc") is not None
+                    and other_task["proc"].poll() is None
+                    for other_tid, other_task in list(active_tasks.items())
+                )
+                if duplicate_active:
+                    root.after(0, lambda u=username: log(f"[Auto] @{u} is already being recorded by another task - skipping duplicate start.", "warn"))
+                    update_inactive_target_status(username, "[AUTOMATIC] Monitoring (Offline)...")
+                    set_task_sub_status(task_id, "")
+                    time.sleep(custom_interval)
+                    continue
+
                 task_info["url"] = url
                 root.after(0, lambda u=username: log(f"[Auto] @{u} is LIVE! Moving to Active Recordings...", "good"))
                 
@@ -1659,22 +1744,55 @@ def add_inactive_target_ui(username):
     )
     btn_cog.pack(side="right", padx=(0, 6))
 
-    inactive_targets_ui[key] = {"frame": row, "status_label": lbl_status, "username": username}
+    inactive_targets_ui[key] = {"frame": row, "status_label": lbl_status, "username": username, "status_gen": 0}
     update_inactive_empty_lbl()
     resort_inactive_targets_ui()
 
 
-def update_inactive_target_status(username, status_text):
+def _default_inactive_status_text(username):
     key = username.lower()
-    if key in inactive_targets_ui:
-        lbl = inactive_targets_ui[key].get("status_label")
-        def _do_update():
+    cfg = monitored_targets_data.get(key, {})
+    is_fav = cfg.get("mode") == "favorite"
+    tag_prefix = "[⭐ FAVORITE]" if is_fav else "[AUTOMATIC]"
+    return f"{tag_prefix} Manual Only (Offline)" if is_fav else f"{tag_prefix} Offline"
+
+
+def update_inactive_target_status(username, status_text, revert_after=None):
+    """Sets the status line for a target in Inactive Targets. If revert_after
+    (seconds) is given, the line reverts to the normal default status
+    (e.g. the [⭐ FAVORITE] Manual Only (Offline) line) after that delay -
+    used for one-off Check Live results, which otherwise have no follow-up
+    poll to naturally refresh the line back. A generation counter guards
+    against the revert stomping on a newer status set in the meantime."""
+    key = username.lower()
+    if key not in inactive_targets_ui:
+        return
+    entry = inactive_targets_ui[key]
+    entry["status_gen"] = entry.get("status_gen", 0) + 1
+    my_gen = entry["status_gen"]
+
+    def _do_update():
+        try:
+            lbl = entry.get("status_label")
+            if lbl and lbl.winfo_exists():
+                lbl.config(text=status_text)
+        except Exception:
+            pass
+    root.after(0, _do_update)
+
+    if revert_after is not None:
+        def _do_revert():
             try:
+                if inactive_targets_ui.get(key) is not entry:
+                    return  # row was rebuilt/removed
+                if entry.get("status_gen") != my_gen:
+                    return  # something newer already updated this status
+                lbl = entry.get("status_label")
                 if lbl and lbl.winfo_exists():
-                    lbl.config(text=status_text)
+                    lbl.config(text=_default_inactive_status_text(username))
             except Exception:
                 pass
-        root.after(0, _do_update)
+        root.after(int(revert_after * 1000), _do_revert)
 
 
 def remove_inactive_target_ui(username):
@@ -1726,9 +1844,12 @@ def check_live_now(username):
         if url:
             log(f"[Fetch] @{username} is LIVE! Starting recording...", "good")
             start_recording(url=url, username=username)
+        elif detail == CHALLENGE_PAGE_DETAIL:
+            log(f"[Fetch] @{username}: {detail} - opening a browser to solve it automatically.", "warn")
+            root.after(0, lambda: run_manual_challenge_browser(username, pref_rank, allow_lower))
         else:
             log(f"[Fetch] @{username} is currently offline ({detail}).", "normal")
-            update_inactive_target_status(username, f"Offline ({detail})")
+            update_inactive_target_status(username, f"Offline ({detail})", revert_after=10)
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -2117,6 +2238,52 @@ def _extract_hydration_json(html, element_id):
         return None
 
 
+def _resolve_live_url_from_hydration(data, element_id, preferred_rank, allow_below):
+    """Given one parsed hydration JSON blob (SIGI_STATE or
+    __UNIVERSAL_DATA_FOR_REHYDRATION__), decides whether the room is
+    ACTUALLY live right now and, if so, picks a stream URL. Returns
+    (url, detail). url is None if not live / nothing usable.
+
+    Critical: TikTok embeds the room's last-known stream info in this
+    blob even when the user is offline, complete with an already-expired
+    signed FLV URL. Regexing for a "pull-...flv" pattern without checking
+    the status field will happily hand back that stale URL and ffmpeg
+    will immediately 404 on it. The status check below is what tells a
+    genuinely live room apart from a cached-but-dead one - every caller
+    that wants a stream URL out of this data MUST go through here rather
+    than calling _find_all_flv_urls/_select_flv_url directly.
+    """
+    try:
+        live_room = None
+        if isinstance(data, dict):
+            live_room = (data.get("LiveRoom", {})
+                         .get("liveRoomUserInfo", {})
+                         .get("liveRoom", {}))
+
+        if live_room and "status" in live_room:
+            room_status = live_room.get("status")
+            if room_status == 4:
+                return None, f"stream ended (status 4 in {element_id})"
+            elif room_status != 2:
+                return None, f"stream inactive (status {room_status} in {element_id})"
+    except Exception:
+        pass
+
+    raw_str = json.dumps(data) if isinstance(data, (dict, list)) else str(data)
+    if '"status":4' in raw_str or '"status": 4' in raw_str or '"status_code":4' in raw_str:
+        return None, f"stream confirmed ended (status 4 in {element_id})"
+
+    urls = _find_all_flv_urls(data)
+    if not urls:
+        return None, None  # caller should keep trying other element_ids
+
+    url = _select_flv_url(data, preferred_rank, allow_below)
+    if url:
+        return url, element_id
+    else:
+        return None, f"live but no tier meeting the quality setting was offered ({element_id})"
+
+
 def fetch_stream_url_http(username, preferred_rank=None, allow_below=False):
     if preferred_rank is None:
         preferred_rank = QUALITY_RANK["origin"]
@@ -2128,7 +2295,7 @@ def fetch_stream_url_http(username, preferred_rank=None, allow_below=False):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.tiktok.com/",
-        "Sec-Ch-Ua": '"Chromium";v="151", "Not?A_Brand";v="8", "Google Chrome";v="151"',
+        "Sec-Ch-Ua": '"Chromium";v="131", "Not?A_Brand";v="8", "Google Chrome";v="131"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "document",
@@ -2137,50 +2304,329 @@ def fetch_stream_url_http(username, preferred_rank=None, allow_below=False):
         "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1"
     }
-    try:
-        resp = requests.get(target, headers=headers, cookies=jar, timeout=10)
-    except Exception as e:
-        return None, f"request failed: {e}"
+
+    if not CURL_CFFI_AVAILABLE:
+        root.after(0, lambda: log(
+            "[Fetch-Debug] curl_cffi is not installed - falling back to plain "
+            "requests, which TikTok's WAF has been known to block. Run: "
+            "pip install curl_cffi",
+            "warn"
+        ))
+        try:
+            resp = requests.get(target, headers=headers, cookies=jar, timeout=10)
+        except Exception as e:
+            return None, f"request failed: {e}"
+    else:
+        try:
+            resp = cffi_requests.get(
+                target, headers=headers, cookies=jar, timeout=10,
+                impersonate=CURL_CFFI_IMPERSONATE
+            )
+        except Exception as e:
+            return None, f"request failed (curl_cffi): {e}"
+
+    body_len = len(resp.text or "")
+    has_cookies = bool(jar)
+    tag_hits = [eid for eid in HTTP_POLLER_HYDRATION_IDS if eid in resp.text]
+    root.after(0, lambda: log(
+        f"[Fetch-Debug] @{username}: HTTP {resp.status_code}, body={body_len} bytes, "
+        f"cookies_loaded={has_cookies}, hydration_tags_present={tag_hits or 'NONE'}",
+        "normal"
+    ))
 
     if resp.status_code != 200:
         return None, f"HTTP {resp.status_code}"
+
+    if not tag_hits:
+        # Page loaded but contains neither hydration blob at all - this is the
+        # tell for a stale/missing session or an anti-bot interstitial, not a
+        # genuinely offline user. A real offline page still normally embeds
+        # SIGI_STATE/__UNIVERSAL_DATA__ with a "not live" status inside it.
+        snippet = re.sub(r"\s+", " ", (resp.text or "")[:300]).strip()
+        root.after(0, lambda: log(
+            f"[Fetch-Debug] @{username}: no hydration tags found in response. "
+            f"First 300 chars: {snippet!r}",
+            "warn"
+        ))
 
     for element_id in HTTP_POLLER_HYDRATION_IDS:
         data = _extract_hydration_json(resp.text, element_id)
         if data is None:
             continue
 
-        try:
-            live_room = None
-            if isinstance(data, dict):
-                live_room = (data.get("LiveRoom", {})
-                             .get("liveRoomUserInfo", {})
-                             .get("liveRoom", {}))
-            
-            if live_room and "status" in live_room:
-                room_status = live_room.get("status")
-                if room_status == 4:
-                    return None, f"stream ended (status 4 in {element_id})"
-                elif room_status != 2:
-                    return None, f"stream inactive (status {room_status} in {element_id})"
-        except Exception:
-            pass
+        url, detail = _resolve_live_url_from_hydration(data, element_id, preferred_rank, allow_below)
+        if url is not None:
+            return url, detail
+        if detail is not None:
+            # A concrete negative result (ended/inactive/no matching tier) -
+            # trust it and stop, same as before.
+            return None, detail
+        # detail is None: this element_id's blob had no FLV URLs at all,
+        # keep trying the next hydration id.
 
-        raw_str = json.dumps(data) if isinstance(data, (dict, list)) else str(data)
-        if '"status":4' in raw_str or '"status": 4' in raw_str or '"status_code":4' in raw_str:
-            return None, f"stream confirmed ended (status 4 in {element_id})"
-
-        urls = _find_all_flv_urls(data)
-        if not urls:
-            continue
-
-        url = _select_flv_url(data, preferred_rank, allow_below)
-        if url:
-            return url, element_id
-        else:
-            return None, f"live but no tier meeting the quality setting was offered ({element_id})"
-
+    if not tag_hits:
+        return None, CHALLENGE_PAGE_DETAIL
     return None, "stream offline or no stream URLs available"
+
+
+# ── Manual Challenge-Solve Browser ─────────────────────────────────────────
+# When TikTok serves a bot-check stub instead of the real page, no HTTP
+# client can push past it - it requires a real browser actually running
+# TikTok's JS, and sometimes an interactive challenge only a human can clear.
+# This opens a real, visible browser window, waits for the person to solve
+# whatever's shown (or does nothing if it clears on its own), then reads the
+# resulting page + cookies back out and resumes the normal recording flow.
+
+CHALLENGE_SOLVE_TIMEOUT = 240  # seconds to wait for the window to clear
+
+# Global single-flight lock: only ONE challenge browser window is ever open at
+# a time, across every target (manual or automated). Prevents multiple
+# Playwright windows popping up at once if several targets go stale together.
+_challenge_browser_lock = threading.Lock()
+_challenge_browser_active_user = None  # username currently running the flow, or None
+
+AUTO_CHALLENGE_COOLDOWN = 300  # automated/background pollers auto-open the solve browser (no confirmation) at most this often
+_last_auto_challenge_attempt = 0  # time.time() of the last unattended auto-open, global (not per-target)
+_challenge_prompt_pending = set()  # usernames with a "Verification Required" dialog already on screen, to avoid stacking dialogs
+
+
+def save_cookies_from_playwright(cookie_list):
+    """Writes cookies out in the same [{name, value}, ...] shape
+    get_poller_cookie_jar() already knows how to read."""
+    try:
+        simplified = [{"name": c.get("name"), "value": c.get("value")} for c in cookie_list if c.get("name")]
+        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(simplified, f)
+        return True
+    except Exception as e:
+        root.after(0, lambda: log(f"[Challenge] Failed to save cookies: {e}", "warn"))
+        return False
+
+
+def run_manual_challenge_browser(username, preferred_rank, allow_below):
+    global _challenge_browser_active_user
+
+    if not PLAYWRIGHT_AVAILABLE:
+        root.after(0, lambda: log(
+            "[Challenge] playwright is not installed. Run: pip install playwright "
+            "&& playwright install chromium",
+            "warn"
+        ))
+        return
+
+    with _challenge_browser_lock:
+        if _challenge_browser_active_user is not None:
+            busy_user = _challenge_browser_active_user
+            root.after(0, lambda: log(
+                f"[Challenge] A browser window is already open for @{busy_user} - "
+                f"@{username} will be retried on its next poll.", "normal"
+            ))
+            return
+        _challenge_browser_active_user = username
+
+    target = f"https://www.tiktok.com/@{quote(username, safe='.')}/live"
+    root.after(0, lambda: log(f"[Challenge] Opening a browser window for @{username} - solve any prompt shown, "
+                               f"the app will continue automatically once the page loads.", "good"))
+
+    def worker():
+        global _challenge_browser_active_user
+        found_url = None
+        found_detail = None
+        try:
+            os.makedirs(PLAYWRIGHT_PROFILE_DIR, exist_ok=True)
+            with sync_playwright() as pw:
+                context = pw.chromium.launch_persistent_context(
+                    PLAYWRIGHT_PROFILE_DIR,
+                    headless=False,
+                    user_agent=HTTP_POLLER_USER_AGENT,
+                    viewport={"width": 1100, "height": 800},
+                )
+                page = context.new_page()
+                page.goto(target, timeout=30000)
+
+                deadline = time.time() + CHALLENGE_SOLVE_TIMEOUT
+                last_nudge = 0
+                cleared = False
+                while time.time() < deadline:
+                    html = page.content()
+                    tag_hits = [eid for eid in HTTP_POLLER_HYDRATION_IDS if eid in html]
+                    if tag_hits:
+                        cleared = True
+                        break
+                    if time.time() - last_nudge > 15:
+                        last_nudge = time.time()
+                        root.after(0, lambda: log(
+                            f"[Challenge] Still waiting on @{username} - complete any verification "
+                            f"shown in the browser window.", "normal"
+                        ))
+                    time.sleep(1.5)
+
+                if not cleared:
+                    found_detail = "timed out waiting for manual verification"
+                else:
+                    html = page.content()
+                    for element_id in HTTP_POLLER_HYDRATION_IDS:
+                        data = _extract_hydration_json(html, element_id)
+                        if data is None:
+                            continue
+                        url, detail = _resolve_live_url_from_hydration(data, element_id, preferred_rank, allow_below)
+                        if url is not None:
+                            found_url, found_detail = url, detail
+                            break
+                        if detail is not None:
+                            # Concrete negative (ended/inactive/no matching
+                            # tier) - trust it, same as fetch_stream_url_http.
+                            found_detail = detail
+                            break
+                        # detail is None: no FLV URLs in this blob at all,
+                        # try the next hydration id.
+                    if found_url is None and found_detail is None:
+                        found_detail = "verification cleared, but no live stream data was present"
+
+                    save_cookies_from_playwright(context.cookies())
+                    root.after(0, lambda: log(f"[Challenge] Session cookies refreshed from browser for @{username}.", "good"))
+
+                context.close()
+        except Exception as e:
+            found_detail = f"browser automation error: {e}"
+        finally:
+            with _challenge_browser_lock:
+                _challenge_browser_active_user = None
+
+        def finish():
+            if found_url:
+                log(f"[Challenge] @{username} is LIVE! Starting recording...", "good")
+                start_recording(url=found_url, username=username)
+            else:
+                log(f"[Challenge] @{username}: {found_detail}", "warn")
+
+        root.after(0, finish)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def prompt_manual_challenge_browser(username, preferred_rank, allow_below):
+    # Only reached now when the auto-poller's bot-check is recurring faster
+    # than AUTO_CHALLENGE_COOLDOWN allows a silent auto-open - i.e. the
+    # unattended path already tried and it wasn't enough. Deduped per
+    # username so a fast poll interval can't stack multiple dialogs.
+    if is_shutting_down:
+        return
+    key = username.lower()
+    if key in _challenge_prompt_pending:
+        return
+    _challenge_prompt_pending.add(key)
+
+    dlg = tk.Toplevel(root)
+    dlg.title("Verification Required")
+    dlg.configure(bg=SURFACE)
+    dlg.transient(root)
+    dlg.grab_set()
+    dlg.resizable(False, False)
+
+    def cleanup():
+        _challenge_prompt_pending.discard(key)
+
+    dlg.protocol("WM_DELETE_WINDOW", lambda: (cleanup(), dlg.destroy()))
+
+    tk.Label(
+        dlg, text=f"TikTok is showing a bot-check page for @{username}.",
+        font=("Segoe UI", 11, "bold"), fg=FG, bg=SURFACE
+    ).pack(padx=24, pady=(20, 4))
+    tk.Label(
+        dlg, text="Opening a browser window lets you solve it by hand.\n"
+                   "Recording starts automatically once the page loads.",
+        font=FONT_LABEL, fg=FG_DIM, bg=SURFACE, justify="left"
+    ).pack(padx=24, pady=(0, 16))
+
+    btn_frame = tk.Frame(dlg, bg=SURFACE)
+    btn_frame.pack(padx=16, pady=(0, 18))
+
+    def choose_open():
+        cleanup()
+        dlg.destroy()
+        run_manual_challenge_browser(username, preferred_rank, allow_below)
+
+    def choose_cancel():
+        cleanup()
+        dlg.destroy()
+
+    tk.Button(
+        btn_frame, text="Open Browser", font=FONT_BTN, bg=FG_GOOD, fg="#000000",
+        activebackground="#2cb865", activeforeground="#000000",
+        relief="flat", bd=0, padx=16, pady=8, cursor="hand2",
+        command=choose_open
+    ).pack(side="left", padx=(0, 8))
+
+    tk.Button(
+        btn_frame, text="Cancel", font=FONT_LABEL, bg=SURFACE, fg=FG_DIM,
+        activebackground=SURFACE, activeforeground=FG,
+        relief="flat", bd=0, padx=12, pady=8, cursor="hand2",
+        command=choose_cancel
+    ).pack(side="left")
+
+
+def check_session_health_on_startup():
+    """Fires one lightweight HTTP probe shortly after launch to find out
+    whether the saved session still clears TikTok's bot-check, so the
+    manual-solve browser can be offered right away instead of waiting for
+    the first real Check Live / auto-poll to fail."""
+    def worker():
+        if not os.path.exists(COOKIES_FILE):
+            root.after(0, lambda: log(
+                "[Startup] No saved session (cookies.json not found) - "
+                "the first live check will likely need a manual browser solve.",
+                "normal"
+            ))
+            return
+
+        # Probe against whichever target is already configured, since that's
+        # what real polling will hit anyway. Falls back to any handle typed
+        # into the input box, then skips entirely if there's nothing to test.
+        probe_username = None
+        if monitored_targets_data:
+            first_key = next(iter(monitored_targets_data))
+            probe_username = monitored_targets_data[first_key].get("username", first_key)
+        else:
+            typed = get_handle_entry_value()
+            if typed:
+                probe_username = normalize_username(typed)
+        if not probe_username:
+            root.after(0, lambda: log(
+                "[Startup] Skipping session check - no target configured to test against.",
+                "normal"
+            ))
+            return
+
+        root.after(0, lambda: log(f"[Startup] Testing saved session against @{probe_username}...", "normal"))
+        pref_rank, allow_lower = get_effective_quality_settings(probe_username)
+        with http_request_lock:
+            url, detail = fetch_stream_url_http(probe_username, pref_rank, allow_lower)
+
+        if detail == CHALLENGE_PAGE_DETAIL:
+            root.after(0, lambda: log(
+                "[Startup] Bot-check is active for this session - opening a browser to solve it automatically.",
+                "warn"
+            ))
+            root.after(0, lambda: run_manual_challenge_browser(probe_username, pref_rank, allow_lower))
+        elif url:
+            # Session is fine and the probe target happens to be live right
+            # now - report it, but don't start_recording() here. This check
+            # exists to test the session, not to launch recordings; a target
+            # that's actually live gets picked up by its own auto-monitor
+            # poll or a manual Check Live, same as always.
+            root.after(0, lambda: log(
+                f"[Startup] Session is valid - bot-check cleared. (@{probe_username} is also currently live; "
+                f"use Check Live or its own automation to start recording it.)",
+                "good"
+            ))
+        else:
+            root.after(0, lambda: log(
+                f"[Startup] Session looks valid - bot-check not currently required ({detail}).",
+                "good"
+            ))
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def set_target_favorite(username):
@@ -2296,6 +2742,9 @@ def fetch_live_and_record():
                 persist_transcribe_preference(username, transcribe_active)
                 start_recording(url=url, username=username, force_transcribe=transcribe_active)
                 clear_handle_entry()
+            elif detail == CHALLENGE_PAGE_DETAIL:
+                log(f"[Fetch] @{username}: {detail} - opening a browser to solve it automatically.", "warn")
+                run_manual_challenge_browser(username, preferred_rank, allow_lower)
             else:
                 log(f"[Fetch] @{username} is offline or has nothing matching the quality setting ({detail}).", "normal")
                 prompt_offline_action(username)
@@ -2622,6 +3071,7 @@ log("• Add a handle to auto-monitor it, or use the Fetch Live button.", "good"
 log("• Persistent monitoring checks offline users and auto-records when Live.", "good")
 log("• Adjustable polling interval (15s to 5m) via the 'Auto Poll' button.", "normal")
 log("• Links meeting the Quality setting start FFMPEG automatically.", "normal")
+log("• Bot-check pages are solved automatically with a browser window when needed.", "normal")
 log("------------------------------------------------------------", "normal")
 
 # Load persistent quality defaults and targets
@@ -2637,6 +3087,11 @@ for key_name, target_info in list(monitored_targets_data.items()):
 
 # Recover leftover raw .flv files from previous session
 threading.Thread(target=recover_orphaned_flvs, daemon=True).start()
+
+# Probe the saved session once at startup so a stale/challenged session is
+# caught immediately instead of surfacing as a confusing "offline" on the
+# first real check.
+root.after(2000, check_session_health_on_startup)
 
 # Snap the window to the height its content actually needs at startup - the
 # active/inactive lists keep it correct automatically from here on as rows
